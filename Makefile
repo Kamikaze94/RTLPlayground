@@ -4,6 +4,10 @@ DEFAULT_CONFIG_LOCATION = 454656
 CONFIG_LOCATION = 458752
 HTML_LOCATION = 262144
 
+# Startup configuration embedded in the image. Override it to build a specific
+# machine with its own configuration: make MACHINE=<name> CONFIG=<file>
+CONFIG ?= config.txt
+
 SDCC_TOOLCHAIN = sdcc-$(shell cat sdcc/* | cksum | cut -d' ' -f1)
 SDCC_PREFIX = toolchain/$(SDCC_TOOLCHAIN)
 ifeq ($(origin CC),default)
@@ -38,6 +42,9 @@ endif
 ifneq ($(HEALTH),)
 	CC_FLAGS += -DHEALTH
 endif
+ifneq ($(DEBUG),)
+	CC_FLAGS += -DDEBUG
+endif
 
 ifeq ($(CI),1)
 	CC_FLAGS += --Werror
@@ -56,6 +63,7 @@ ifndef BUILDDIR
 	BUILDDIR = output/$(MACHINE)
 endif
 
+CONFIG_STAMP := $(BUILDDIR)/.config
 VERSION_HEADER := version.h
 
 GIT_VERSION := $(shell git rev-parse --short HEAD)
@@ -78,9 +86,10 @@ BUILD_DATE := $(shell date -u -d @$(SOURCE_DATE_EPOCH) +"%Y-%m-%d %H:%M:%S" 2>/d
 	|| date -u -r $(SOURCE_DATE_EPOCH) +"%Y-%m-%d %H:%M:%S")
 endif
 
-# $(MACHINE_SRC) is listed here so an unknown $MACHINE fails before anything else
-# is built, including the tools/ subdirectory.
-all: create_build_dir $(VERSION_HEADER) $(MACHINE_SRC) $(SUBDIRS) $(BUILDDIR)/rtlplayground-$(FILENAME_EXTENSION).bin
+# $(MACHINE_SRC) and $(CONFIG) are listed here so an unknown $MACHINE or a
+# missing config file fails before anything else is built, including the tools/
+# subdirectory.
+all: create_build_dir $(VERSION_HEADER) $(MACHINE_SRC) $(CONFIG) $(SUBDIRS) $(BUILDDIR)/rtlplayground-$(FILENAME_EXTENSION).bin
 
 bank_size:
 	tools/bank_occupancy.sh "$(MACHINE)"
@@ -90,6 +99,7 @@ create_build_dir: $(SDCC)
 	mkdir -p "$(BUILDDIR)/uip"
 	mkdir -p "$(BUILDDIR)/httpd"
 	mkdir -p "$(BUILDDIR)/machine"
+	mkdir -p "$(BUILDDIR)/crypto"
 
 # Every machine is a pair machine/<MACHINE>.c + machine/<MACHINE>.h. Selecting
 # them by name means no #if/#elif chain, so an unknown or empty $MACHINE is
@@ -99,6 +109,12 @@ $(MACHINE_SRC):
 	@echo "       Every machine is one file pair under machine/, named after the" >&2
 	@echo "       MACHINE_* symbol it defines; see machine/*.c for the full list." >&2
 	@echo "       Example: make MACHINE=KP_9000_6XHML_X2" >&2
+	@false
+
+# Fail with a clear message when CONFIG names a file that does not exist.
+$(CONFIG):
+	@echo "ERROR: CONFIG='$(CONFIG)' does not exist." >&2
+	@echo "       Point CONFIG at a configuration file, or omit it to use config.txt." >&2
 	@false
 
 # Keep the per-machine definition in first position to fail immediately on an
@@ -119,7 +135,9 @@ SRCS = \
 	ntp.c \
 	ntp_cli.c \
 	syslog.c \
-	udp_apps.c
+	timer.c \
+	udp_apps.c \
+	crypto/chacha20.c
 
 # RTL837x
 SRCS += \
@@ -138,12 +156,14 @@ SRCS += \
 	rtl837x_lldp.c \
 	rtl837x_storm.c \
 	rtl837x_lacp.c \
-	rtl837x_trap.c
+	rtl837x_trap.c \
+	rtl837x_stp_cli.c
 SRCS += \
 	httpd/httpd.c \
-	httpd/page_impl.c
+	httpd/page_impl.c \
+	httpd/html_out.c \
+	httpd/page_stp.c
 SRCS += \
-	uip/timer.c \
 	uip/uip.c \
 	uip/uiplib.c \
 	uip/uip_arp.c \
@@ -153,7 +173,7 @@ SRCS += \
 
 OBJS = ${SRCS:%.c=$(BUILDDIR)/%.rel}
 DEPS := ${SRCS:%.c=$(BUILDDIR)/%.d}
-HTML := $(shell find html -name '*.js' -or -name '*.html' -or -name '*.svg' -or -name '*.css' -or -name '*.ico')
+HTML := $(shell find html -name '*.html' -or -name '*.svg' -or -name '*.css' -or -name '*.ico')
 
 # Minified copy of the web UI sources, used as the fileadder input.
 # The raw html/ sources stay untouched for development; the minified
@@ -169,10 +189,11 @@ $(HTML_MIN_LIST): FORCE
 	@echo $(sort $(HTML)) > $@.tmp
 	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv $@.tmp $@
 
-$(HTML_MIN_STAMP): $(HTML) $(HTML_MIN_LIST) tools/minify.py $(if $(wildcard $(HTML_MIN)),,FORCE)
+$(HTML_MIN_STAMP): $(HTML) html/app.js $(HTML_MIN_LIST) tools/minify.py tools/rjsmin.py $(if $(wildcard $(HTML_MIN)),,FORCE)
 	rm -rf $(HTML_MIN)
 	mkdir -p $(HTML_MIN)
 	@for f in $(HTML); do python3 tools/minify.py $$f $(HTML_MIN)/$$(basename $$f) || exit 1; done
+	python3 tools/rjsmin.py < html/app.js > $(HTML_MIN)/app.js || exit 1
 	@touch $@
 
 html_data.c html_data.h &: $(HTML_MIN_STAMP) | tools
@@ -220,6 +241,12 @@ FORCE:
 $(CCFLAGS_STAMP): FORCE | create_build_dir
 	@echo '$(CC_FLAGS)' | cmp -s - $@ 2>/dev/null || echo '$(CC_FLAGS)' > $@
 
+# The same for $(CONFIG): its path is stamped so switching to a config file
+# older than the image still rebuilds it, while $(CONFIG) itself as a normal
+# prerequisite covers edits to the selected file.
+$(CONFIG_STAMP): FORCE | create_build_dir
+	@echo '$(CONFIG)' | cmp -s - $@ 2>/dev/null || echo '$(CONFIG)' > $@
+
 $(BUILDDIR)/%.rel: %.c $(CCFLAGS_STAMP) | create_build_dir html_data.h
 	$(CC) -MMD $(CC_FLAGS) -o $@ -c $<
 
@@ -227,17 +254,17 @@ $(BUILDDIR)/%.rel: %.asm $(CCFLAGS_STAMP) | create_build_dir
 	${ASM} ${AFLAGS} -o $@ $<
 #	mv -f $(addprefix $(basename $^), .lst .rel .sym) .
 
-$(BUILDDIR)/rtlplayground.ihx: $(OBJS) $(BUILDDIR)/crtbank.rel $(BUILDDIR)/crc16.rel
-	$(CC) $(CC_FLAGS) --xram-size 49151 -Wl-bHOME=0x00000 -Wl-bBANK1=0x14000 -Wl-bBANK2=0x24000 -Wl-bBANK3=0x34000 -Wl-r -o $@ $^
+$(BUILDDIR)/rtlplayground.ihx: $(OBJS) $(BUILDDIR)/crtbank.rel $(BUILDDIR)/crc16.rel $(BUILDDIR)/crypto/chacha_8051.rel
+	$(CC) $(CC_FLAGS) --xram-size 49151 -Wl-bHOME=0x00000 -Wl-bBANK1=0x14000 -Wl-bBANK2=0x24000 -Wl-bBANK3=0x34000 -Wl-bBANK4=0x44000 -Wl-r -o $@ $^
 
 $(BUILDDIR)/rtlplayground.img: $(BUILDDIR)/rtlplayground.ihx
 	objcopy --input-target=ihex -O binary $< $@
 
-$(BUILDDIR)/rtlplayground-$(FILENAME_EXTENSION).bin: $(BUILDDIR)/rtlplayground.img | tools
+$(BUILDDIR)/rtlplayground-$(FILENAME_EXTENSION).bin: $(BUILDDIR)/rtlplayground.img $(CONFIG) $(CONFIG_STAMP) | tools
 	if [ -e $@ ]; then rm $@; fi
-	tools/$(BUILDDIR)/imagebuilder -i $^ $@
-	tools/$(BUILDDIR)/fileadder -a $(DEFAULT_CONFIG_LOCATION) -s $(IMAGESIZE) -d config.txt $@
-	tools/$(BUILDDIR)/fileadder -a $(CONFIG_LOCATION) -s $(IMAGESIZE) -d config.txt $@
+	tools/$(BUILDDIR)/imagebuilder -i $(BUILDDIR)/rtlplayground.img $@
+	tools/$(BUILDDIR)/fileadder -a $(DEFAULT_CONFIG_LOCATION) -s $(IMAGESIZE) -d "$(CONFIG)" $@
+	tools/$(BUILDDIR)/fileadder -a $(CONFIG_LOCATION) -s $(IMAGESIZE) -d "$(CONFIG)" $@
 	tools/$(BUILDDIR)/fileadder -a $(HTML_LOCATION) -s $(IMAGESIZE) -z -d $(HTML_MIN) -b BANK1 $@
 	tools/$(BUILDDIR)/crc_calculator -u $@
 	ln -sf $(MACHINE)/rtlplayground-$(FILENAME_EXTENSION).bin $(BUILDDIR)/../rtlplayground.bin

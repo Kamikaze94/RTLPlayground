@@ -634,9 +634,15 @@ void parse_vlan(void)
 		vlan_settings.vlan = atoi_results_short;
 
 		if (cmd_compare(2, "mgmt")) {
+			if (management_vlan == vlan_settings.vlan) {
+				print_string("Management VLAN unchanged\n");
+				return;
+			}
 			port_l2_static_mgmt(uip_ethaddr.addr, management_vlan, true);
 			management_vlan = vlan_settings.vlan;
 			port_l2_static_mgmt(uip_ethaddr.addr, management_vlan, false);
+			if (dhcp_state.state != DHCP_OFF)
+				dhcp_start();
 			if (!vlan_settings.vlan)
 				print_string("Management VLAN disabled\n");
 			else
@@ -945,6 +951,8 @@ void parse_port(void)
 		print_string("\"\n");
 	} else if (cmd_compare(2, "lldp")) {
 		if (cmd_compare(3, "block")){
+			if (lldp_enabled)
+				lldp_shutdown((uint16_t)1 << phy_settings.port);
 			lldp_logical_port_status &= ~((uint16_t)1 << phy_settings.port);
 		} else if (cmd_compare(3, "permit")) {
 			lldp_logical_port_status |= (uint16_t)1 << phy_settings.port;
@@ -1870,6 +1878,10 @@ void cmd_parser(void) __banked
 		if (cmd_compare(0, "reset")) {
 			print_string("\nRESET\n\n");
 			reset_chip();
+		} else if (cmd_compare(0, "factory-reset")) {
+			print_string("\nFACTORY RESET\n\n");
+			flash_default_config();
+			reset_chip();
 		} else if (cmd_compare(0, "sfp")) {
 			parse_sfp();
 		} else if (cmd_compare(0, "stat")) {
@@ -2089,6 +2101,8 @@ void cmd_parser(void) __banked
 				trap_rma_set(RTL837X_RMA0E_CONF, RTL837X_RMA_ACT_TRAP);
 			} else {
 				print_string("LLDP disabled\n");
+				if (lldp_enabled)
+					lldp_shutdown(lldp_logical_port_status);
 				lldp_enabled = 0;
 				trap_rma_set(RTL837X_RMA0E_CONF, RTL837X_RMA_ACT_FORWARD);
 			}
